@@ -3,6 +3,7 @@
 /ssl
 
 node_modules/
+prisma/
 
 # misc
 .DS_Store
