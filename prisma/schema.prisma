@@ -1,0 +1,413 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+// ===================================
+// TAMBAHAN BARU: Model Diskon & Kupon
+// ===================================
+
+model Sale {
+  id            String       @id @default(uuid())
+  name          String // "Black Friday Sale"
+  description   String?
+  discountType  DiscountType // PERCENTAGE atau FIXED_AMOUNT
+  discountValue Float
+  startDate     DateTime
+  endDate       DateTime
+  
+  // Kursus apa saja yang termasuk dalam diskon ini
+  courses       Course[]     @relation("CourseSales")
+  
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  // Relasi opsional ke transaksi yang menggunakan sale ini
+  transactions  Transaction[]
+
+  @@index([startDate, endDate])
+}
+
+model Coupon {
+  id            String       @id @default(uuid())
+  code          String       @unique // "HEMAT50"
+  description   String?
+  discountType  DiscountType
+  discountValue Float
+  expiresAt     DateTime?    // Kapan kupon hangus
+  maxUses       Int?         // Berapa kali total bisa dipakai
+  currentUses   Int          @default(0)
+  
+  // Kupon ini berlaku untuk...
+  courses       Course[]     @relation("CouponCourses")
+  categories    Category[]   @relation("CouponCategories")
+  
+  // authId String? // Opsional: untuk kupon personal
+  
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  // Relasi opsional ke transaksi yang menggunakan kupon ini
+  transactions  Transaction[]
+
+  @@index([code])
+  @@index([expiresAt])
+}
+
+enum DiscountType {
+  PERCENTAGE
+  FIXED_AMOUNT
+}
+
+
+// ===================================
+// MODIFIKASI: Model yang Sudah Ada
+// ===================================
+
+model Course {
+  id          Uuid         @id @default(uuid())
+  title       String
+  description String
+  thumbnail   String?
+  price       Float        @default(0)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  teacherId   Uuid
+  slug        String       @unique
+  level       CourseLevel
+  status      CourseStatus @default(DRAFT)
+  hashtags    String[]
+  isFree      Boolean      @default(false)
+  license     CourseLicense @default(NT)
+
+  cartItems   CartItem[]
+  chapters    Chapter[]
+  teacher     Teacher      @relation(fields: [teacherId], references: [id])
+  enrollments Enrollment[]
+  reviews     Review[]
+  wishlists   Wishlist[]
+  categories  Category[]   @relation("CourseCategories")
+  tags        Tag[]        @relation("CourseTags")
+  loves       CourseLove[] @relation("CourseLoves")
+  
+  // --- RELASI BARU ---
+  sales       Sale[]       @relation("CourseSales")
+  coupons     Coupon[]     @relation("CouponCourses")
+}
+
+model Category {
+  id          Uuid       @id @default(uuid()) // ✅ PERBAIKAN
+  name        String     @unique
+  parentId    Uuid? // ✅ PERBAIKAN
+  description String?
+  slug        String     @unique
+  parent      Category?  @relation("CategoryToSub", fields: [parentId], references: [id])
+  children    Category[] @relation("CategoryToSub")
+  courses     Course[]   @relation("CourseCategories")
+  coupons     Coupon[]   @relation("CouponCategories")
+}
+
+model Transaction {
+  id              String   @id @default(uuid())
+  midtransOrderId String   @unique
+  status          String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  cartId          String
+  authId          String
+  cart            Cart     @relation(fields: [cartId], references: [id])
+  
+  // --- MODIFIKASI PENTING UNTUK PRICING ---
+  
+  // Total harga asli sebelum diskon
+  baseAmount      Float
+  
+  // Total diskon yang didapat
+  discountAmount  Float    @default(0)
+  
+  // Harga akhir yang dibayar (baseAmount - discountAmount)
+  totalAmount     Float
+  
+  // ID Kupon/Sale yang digunakan (jika ada)
+  couponId        String?
+  saleId          String?
+  
+  // Relasi opsional untuk melacak
+  coupon          Coupon?  @relation(fields: [couponId], references: [id])
+  sale            Sale?    @relation(fields: [saleId], references: [id])
+  // ----------------------------------------
+
+  @@index([couponId])
+  @@index([saleId])
+}
+
+
+// ===================================
+// SISA SKEMA (Tidak berubah)
+// ===================================
+
+model Teacher {
+  id       Uuid     @id @default(uuid()) // ✅ PERBAIKAN
+  authId   String   @unique // Ini tetap String, ini adalah "Paspor"
+  name     String
+  bio      String?
+  username String   @unique
+  courses  Course[]
+  lovesCourse       CourseLove[]  @relation("TeacherCourseLoves") 
+  givenLoves        UserLove[]    @relation("LoveGivenByTeacher") 
+  receivedLoves     UserLove[]    @relation("LoveReceivedByTeacher") 
+}
+
+model Category {
+  id          Uuid       @id @default(uuid()) // ✅ PERBAIKAN
+  name        String     @unique
+  parentId    Uuid? // ✅ PERBAIKAN
+  description String?
+  slug        String     @unique
+  parent      Category?  @relation("CategoryToSub", fields: [parentId], references: [id])
+  children    Category[] @relation("CategoryToSub")
+  courses     Course[]   @relation("CourseCategories")
+  coupons     Coupon[]   @relation("CouponCategories")
+}
+
+model Chapter {
+  id       Uuid     @id @default(uuid()) // ✅ PERBAIKAN
+  title    String
+  order    Int
+  courseId Uuid // ✅ PERBAIKAN
+  slug     String   @unique
+  course   Course   @relation(fields: [courseId], references: [id])
+  lessons  Lesson[]
+}
+
+model Lesson {
+  id         Uuid    @id @default(uuid()) // ✅ PERBAIKAN
+  title      String
+  order      Int
+  chapterId  Uuid // ✅ PERBAIKAN
+  duration   Int?
+  playbackId String
+  isPreview  Boolean @default(false)
+  chapter    Chapter @relation(fields: [chapterId], references: [id])
+}
+
+model Review {
+  id        Uuid    @id @default(uuid()) // ✅ PERBAIKAN
+  courseId  Uuid // ✅ PERBAIKAN
+  studentId Uuid // ✅ PERBAIKAN
+  rating    Int     @default(5)
+  comment   String?
+  course    Course  @relation(fields: [courseId], references: [id])
+  student   Student @relation(fields: [studentId], references: [id])
+}
+
+model Student {
+  id       Uuid     @id @default(uuid()) // ✅ PERBAIKAN
+  authId   String   @unique // Ini tetap String
+  name     String
+  username String   @unique
+  reviews  Review[]
+  lovesCourse       CourseLove[]  @relation("StudentCourseLoves") 
+  givenLoves        UserLove[]    @relation("LoveGivenByStudent")
+  receivedLoves     UserLove[]    @relation("LoveReceivedByStudent")
+}
+
+model Tag {
+  id      Uuid     @id @default(uuid()) // ✅ PERBAIKAN
+  name    String   @unique
+  slug    String   @unique
+  courses Course[] @relation("CourseTags")
+}
+
+model Enrollment {
+  id        Uuid     @id @default(uuid()) // ✅ PERBAIKAN
+  authId    String   // Ini tetap String
+  userRole  Role
+  courseId  Uuid // ✅ PERBAIKAN
+  createdAt DateTime @default(now())
+  course    Course   @relation(fields: [courseId], references: [id])
+
+  @@unique([authId, courseId])
+}
+
+model Cart {
+  id           String        @id @default(uuid())
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  authId       String
+  items        CartItem[]
+  transactions Transaction[]
+}
+
+model CartItem {
+  id       String   @id @default(uuid()) // ❗️ Biarkan String
+  cartId   String
+  courseId Uuid // ✅ PERBAIKAN
+  addedAt  DateTime @default(now())
+  cart     Cart     @relation(fields: [cartId], references: [id])
+  course   Course   @relation(fields: [courseId], references: [id])
+
+  @@unique([cartId, courseId])
+}
+
+model Transaction {
+  id              String   @id @default(uuid())
+  midtransOrderId String   @unique
+  status          String
+  totalAmount     Float
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  cartId          String
+  authId          String
+  cart            Cart     @relation(fields: [cartId], references: [id])
+}
+
+model Wishlist {
+  id        Uuid     @id @default(uuid()) // ✅ PERBAIKAN
+  authId    String
+  userRole  Role
+  courseId  Uuid // ✅ PERBAIKAN
+  createdAt DateTime @default(now())
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([authId, courseId])
+}
+
+model Notification {
+  id           String           @id @default(uuid())
+  authId       String           // User yang menerima notifikasi
+  message      String
+  isRead       Boolean          @default(false)
+  createdAt    DateTime         @default(now())
+  type         NotificationType @default(COURSE_LIKE)
+  courseId     String?          // Relasi ke course (jika terkait course)
+  actorId      String?          // User yang melakukan action
+  relatedId    String?          // ID terkait (reviewId, enrollmentId, dll)
+  urgency      NotificationUrgency @default(NORMAL) // Tingkat urgensi
+
+  // Indexes untuk optimasi query
+  @@index([authId])
+  @@index([isRead])
+  @@index([createdAt])
+  @@index([type])
+}
+
+enum NotificationType {
+  COURSE_LIKE          // User menyukai course
+  COURSE_REVIEW        // User memberikan review pada course
+  NEW_ENROLLMENT       // User baru enroll ke course
+  NEW_FOLLOWER         // User baru mengikuti teacher
+  COURSE_PUBLISHED     // Course berhasil dipublish
+  COURSE_APPROVED      // Course disetujui admin
+  COURSE_REJECTED      // Course ditolak admin
+  PAYMENT_SUCCESS      // Pembayaran berhasil
+  PAYMENT_FAILED       // Pembayaran gagal
+  SYSTEM_ANNOUNCEMENT  // Pengumuman sistem
+  TEACHER_VERIFIED     // Teacher terverifikasi
+  ACHIEVEMENT_UNLOCKED // Pencapaian terbuka
+  COMMENT_REPLY        // Balasan komentar
+  MENTION              // Disebut dalam diskusi
+  WISHLIST_REMINDER    // Pengingat wishlist
+  COURSE_UPDATE        // Update course baru
+  CERTIFICATE_READY    // Sertifikat siap
+  SUPPORT_REPLY        // Balasan support ticket
+  AFFILIATE_EARNINGS   // Penghasilan affiliate
+  BADGE_EARNED         // Mendapatkan badge
+}
+
+// Tambahkan enum untuk tingkat urgensi notifikasi
+enum NotificationUrgency {
+  LOW
+  NORMAL
+  HIGH
+  CRITICAL
+}
+
+enum CourseStatus {
+  DRAFT
+  INCOMPLETE
+  PENDING_REVIEW
+  FOLLOWED_UP
+  APPROVED
+  PUBLISHED
+  REJECTED
+  UNPUBLISHED
+  ARCHIVED
+}
+
+enum CourseLicense {
+  EE
+  ET
+  NT
+}
+
+enum CourseLevel {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+}
+
+enum Role {
+  STUDENT
+  TEACHER
+}
+
+model CourseLove {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now())
+  
+  // Relasi ke Course
+  course   Course   @relation(fields: [courseId], references: [id], name: "CourseLoves")
+  courseId String
+
+  // Relasi ke Teacher (jika yang like adalah teacher)
+  teacher   Teacher? @relation(fields: [teacherId], references: [id], name: "TeacherCourseLoves")
+  teacherId String?
+
+  // Relasi ke Student (jika yang like adalah student)
+  student   Student? @relation(fields: [studentId], references: [id], name: "StudentCourseLoves")
+  studentId String?
+
+  // Tambahkan field authId dan userRole untuk kemudahan query
+  authId   String
+  userRole Role
+
+  @@unique([authId, courseId])
+}
+
+model UserLove {
+  id           String   @id @default(uuid())
+  createdAt    DateTime @default(now())
+  
+  // User yang memberikan like (bisa Teacher atau Student)
+  authId     String
+  userRole   Role
+  
+  // User yang menerima like
+  lovedUserId String
+
+  // Relasi ke Teacher (jika yang like adalah teacher)
+  teacher   Teacher? @relation(fields: [teacherId], references: [id], name: "LoveGivenByTeacher")
+  teacherId String?
+
+  // Relasi ke Student (jika yang like adalah student)
+  student   Student? @relation(fields: [studentId], references: [id], name: "LoveGivenByStudent")
+  studentId String?
+
+  // Relasi ke Teacher (jika yang di-like adalah teacher)
+  lovedTeacher   Teacher? @relation(fields: [lovedTeacherId], references: [id], name: "LoveReceivedByTeacher")
+  lovedTeacherId String?
+
+  // Relasi ke Student (jika yang di-like adalah student)
+  lovedStudent   Student? @relation(fields: [lovedStudentId], references: [id], name: "LoveReceivedByStudent")
+  lovedStudentId String?
+
+  @@unique([authId, lovedUserId])
+}
+
