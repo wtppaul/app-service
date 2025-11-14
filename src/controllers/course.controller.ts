@@ -3,7 +3,10 @@ import { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { generateCourseSlug } from '../utils/slug';
 import { prisma } from '../utils/prisma';
-import { CourseStatus } from '../../generated/prisma';
+import {
+  CourseStatus as EnumCourseStatus, 
+  CourseLevel, 
+  CourseLicense } from '../../generated/prisma';
 import {
   createCourseService,
   updateCourseService,
@@ -13,9 +16,8 @@ import {
   getAllCoursesService,
   getCourseBySlugService,
   getCourseByIdService,
-  getAllCoursesByCategoryService,
-  getAllCoursesByTagService,
   getCoursesITeachService,
+  updateCourseStatusByIdService,
 } from '../services/course.service';
 import { statusDescriptions } from '../config/types/courseStatus';
 import { CourseCreateData, CourseUpdateData } from '../config/types/course';
@@ -29,9 +31,8 @@ import {
 } from '../config/schemas/courseQuery.schema';
 import sanitizeInput from '../utils/xInputSanitize';
 import { validateCourseOwnership } from '../utils/validateAccess';
-import { updateCourseStatusById } from '../services/course.service';
 import { getCoursesByTeacherIdService } from '../services/course.service';
-import { CourseFromGo } from '../services/course.service'; 
+import { CourseFromGo, ChapterFromGo } from '../services/course.service'; 
 import { checkEnrollmentService } from '../services/payment.service';
 
 const DEFAULT_PAGE = 1;
@@ -48,72 +49,148 @@ const DEFAULT_LIMIT = 11;
 //   ARCHIVED: 'Deprecated course. No longer maintained.',
 // };
 
-//  /api/courses?status=PUBLISHED,APPROVED
+// ✅
 export const getAllCoursesController = async (
   req: FastifyRequest,
   reply: FastifyReply
 ) => {
   try {
-    const query = req.query as { query: string };
-
+    const query = req.query as any;
     let isAdmin = false;
+    let parsedFilters: any;
 
-    // 1. Validasi apakah query cocok dengan public schema
-    const parsedPublic = publicCourseQuerySchema.safeParse(query);
-    console.log('PARSE FILTER:PUB : ', parsedPublic);
-    if (!parsedPublic.success) {
-      // 2. Jika bukan akses publik, validasi token
-      const token = req.cookies?.accessToken;
-      if (!token) {
-        return reply.status(404).send({
-          message:
-            'Oopsie! The page took a little vacation.  Let’s get you back on track.',
-        });
+    // 1. Cek Token Admin (Logika Bisnis "Pintar")
+    const token = req.cookies?.accessToken;
+    if (token) {
+      try {
+        // (Asumsi gateway Anda akan menggantikan ini)
+        // Untuk sekarang, kita cek manual
+        const decoded = verifyToken(token);
+        if (decoded && decoded.role === 'admin') {
+          isAdmin = true;
+        }
+      } catch (e) {
+        // Token tidak valid, abaikan, anggap sebagai publik
       }
+    }
 
-      const decoded = verifyToken(token);
-      if (!decoded || decoded.role !== 'admin') {
-        return reply.status(404).send({
-          message:
-            'You’ve discovered a secret place... oh wait, it’s just a missing page.',
-        });
-      }
-
-      isAdmin = true;
-
-      // 3. Validasi query sebagai admin
+    // 2. Validasi Query (Logika Bisnis "Pintar")
+    if (isAdmin) {
+      // Admin boleh filter status apa saja
       const parsedAdmin = adminCourseQuerySchema.safeParse(query);
-      console.log('PARSE FILTER:ADM : ', parsedAdmin);
       if (!parsedAdmin.success) {
         return reply.status(400).send({
-          message: 'Oops! Looks like you’ve wandered off the map.',
+          message: 'Admin query invalid',
           details: parsedAdmin.error.flatten(),
         });
       }
+      parsedFilters = parsedAdmin.data;
+    } else {
+      // Publik HANYA boleh lihat PUBLISHED
+      const parsedPublic = publicCourseQuerySchema.safeParse(query);
+      if (!parsedPublic.success) {
+        return reply.status(400).send({
+          message: 'Public query invalid',
+          details: parsedPublic.error.flatten(),
+        });
+      }
+      parsedFilters = parsedPublic.data;
+
+      // ✅ LOGIKA BFF: Paksa filter status untuk publik
+      parsedFilters.status = ['PUBLISHED'];
     }
 
-    const filters = parseQueryParams(query);
+    // 3. Ambil Paginasi
+    const page = parsedFilters.page || DEFAULT_PAGE;
+    const limit = parsedFilters.limit || DEFAULT_LIMIT;
+    
+    // Hapus properti paginasi dari filter sebelum dikirim ke Go
+    delete parsedFilters.page;
+    delete parsedFilters.limit;
+
+    // 4. Panggil Go service "bodoh" (via service axios)
+    // Kirim filter yang sudah divalidasi dan "dipaksa"
     const result = await getAllCoursesService({
-      filters,
-      page: DEFAULT_PAGE,
-      limit: DEFAULT_LIMIT,
+      filters: parsedFilters,
+      page: page,
+      limit: limit,
     });
 
-    return reply.code(200).send(result);
-  } catch (err) {
-    if (err instanceof ZodError) {
-      return reply.status(400).send({
-        message: 'Oops! Looks like you’ve wandered off the map...',
-        details: err.flatten(),
-      });
-    }
+    // 5. Lakukan "Enrichment" (jika perlu)
+    const enhancedData = result.data.map((course: CourseFromGo) => ({
+      ...course,
+      statusDescription: statusDescriptions[course.status] || course.status,
+    }));
 
-    console.error('Error in getAllCoursesController:', err);
-    return reply.status(500).send({ message: 'Internal Server Error' });
+    return reply.code(200).send({
+      data: enhancedData,
+      pagination: result.pagination,
+    });
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in getAllCoursesController (BFF):', err);
+    if (err instanceof Error) {
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
 
-// --- EDIT DENGAN ERROR HANDLING YANG BENAR ---
+// ✅ 
+export const getAllCoursesByCategoryController = async (
+  req: FastifyRequest,
+  reply: FastifyReply
+) => {
+  // Cukup teruskan request-nya ke getAllCoursesController
+  // karena Go service kita sudah bisa menangani filter 'category'
+  
+  // 1. Ambil query string
+  const query = req.query as any;
+  
+  // 2. (PENTING) Ambil slug kategori dari query
+  const categorySlug = query.categorySlug;
+  const subCategorySlug = query.subCategorySlug;
+  
+  // 3. Set filter 'category' untuk diteruskan ke getAllCourses
+  //    Go service kita mengharapkan param 'category'
+  if (subCategorySlug) {
+    query.category = subCategorySlug;
+  } else if (categorySlug) {
+    // TODO: Ini perlu logika lebih. Jika 'categorySlug' adalah kategori induk,
+    // haruskah kita mencari semua sub-kategorinya?
+    // Untuk saat ini, kita cari slug yang cocok saja.
+    query.category = categorySlug; 
+  }
+  
+  // Hapus slug lama agar tidak bentrok
+  delete query.categorySlug;
+  delete query.subCategorySlug;
+
+  // 4. Panggil controller utama
+  // (Kita mengganti req.query dengan 'query' kita yang sudah dimodifikasi)
+  req.query = query;
+  return getAllCoursesController(req, reply);
+};
+
+// ✅ 
+export const getAllCoursesByTagController = async (
+  req: FastifyRequest,
+  reply: FastifyReply
+) => {
+  // Cukup teruskan request-nya ke getAllCoursesController
+  // karena Go service kita sudah bisa menangani filter 'tag'
+  
+  // 1. Ambil query string
+  const query = req.query as any;
+
+  // 2. Ambil 'tag' dari query (Go service kita mengharapkan 'tag')
+  const tagSlug = query.tag; // (Asumsi query-nya ?tag=nama-tag)
+
+  // 3. Panggil controller utama
+  return getAllCoursesController(req, reply);
+};
+
+// ✅
 export const getCourseBySlugController = async (
   req: FastifyRequest,
   reply: FastifyReply
@@ -136,7 +213,7 @@ export const getCourseBySlugController = async (
         ) 
       : 0;
       
-    // ✅ PERBAIKAN: 'course.status' sekarang BUKAN 'any'.
+    // PERBAIKAN: 'course.status' sekarang BUKAN 'any'.
     // Ini adalah tipe 'EnumCourseStatus' (alias 'CourseStatus').
     // Error 'ts(7053)' akan hilang.
     const statusDescription = statusDescriptions[course.status] || course.status;
@@ -176,10 +253,9 @@ export const getCourseBySlugController = async (
     return reply.status(404).send({ message: 'Course not found' });
     // --- (AKHIR LOGIKA BISNIS) ---
 
-  } catch (error: unknown) { // ✅ Tipe 'error' adalah 'unknown'
+  } catch (error: unknown) { 
     console.error(error);
     
-    // ✅ Kita periksa tipe error-nya
     if (error instanceof Error) {
       if (error.message === 'Course not found') {
         return reply.status(404).send({ message: 'Course not found' });
@@ -191,76 +267,85 @@ export const getCourseBySlugController = async (
     return reply.status(500).send({ message: 'An unknown internal error occurred' });
   }
 };
-// --- AKHIR EDIT ---
 
-/**
- *
- * api/courses/category?status=PUBLISHED&categorySlug=jewelry-making-wire-resin-metal-clay
- * api/courses/category?status=PUBLISHED
- *
- */
+// ✅
 export const getCourseByIdController = async (
   req: FastifyRequest,
   reply: FastifyReply
 ) => {
   try {
     const { courseId } = req.params as { courseId: string };
+    const authId = (req as any).user?.id; // Diambil dari gateway
+    const role = (req as any).user?.role; // Diambil dari gateway
 
-    const course = await getCourseByIdService(courseId);
+    // 1. Panggil Go service "bodoh"
+    const course: CourseFromGo = await getCourseByIdService(courseId);
 
-    if (!course) {
-      return reply.status(404).send({ message: 'Course not found' });
+    // 2. Logika "Enrichment" (BFF) - Sama persis dengan getBySlug
+    const totalChapters = course.chapters ? course.chapters.length : 0;
+    const totalLessons = course.chapters
+      ? course.chapters.reduce(
+          (sum: number, chapter: ChapterFromGo) => {
+            return sum + (chapter.lessons ? chapter.lessons.length : 0);
+          },
+          0
+        )
+      : 0;
+    const statusDescription =
+      statusDescriptions[course.status] || course.status;
+
+    const enhancedCourse = {
+      ...course,
+      totalChapters,
+      totalLessons,
+      statusDescription,
+    };
+
+    // 3. Logika Bisnis "Pintar" (Akses) - Sama persis dengan getBySlug
+    const isPublished = course.status === 'PUBLISHED';
+    const isArchived = course.status === 'ARCHIVED';
+
+    if (isPublished) {
+      return reply.send(enhancedCourse);
     }
 
-    // Jika course BELUM PUBLISHED, hanya admin atau teacher yang membuatnya yang boleh lihat
-    if (course.status !== 'PUBLISHED') {
-      const cleanInput = req.cookies?.accessToken;
-      const token = cleanInput;
-      if (!token) {
-        return reply.status(403).send({ message: 'Access denied' });
-      }
-
-      const decoded = verifyToken(token);
-      const authId = decoded?.id;
-      const role = decoded?.role;
-
-      // Admin boleh akses
-      if (role === 'admin') {
-        return reply.send(course);
-      }
-
-      // Teacher harus cocok dengan teacherId course
-      if (role === 'teacher') {
-        const teacher = await prisma.teacher.findUnique({
-          where: { authId },
-        });
-
-        if (!teacher || teacher.id !== course.teacherId) {
-          return reply.status(403).send({ message: 'Access denied' });
-        }
-
-        console.log(
-          'teacherAuthId :: ',
-          teacher.id,
-          ' -- courseTeacherId :: ',
-          course.teacherId
-        );
-
-        return reply.send(course);
-      }
-
-      // Role lain tidak boleh akses
+    // --- Jika TIDAK dipublikasi ---
+    if (!authId || !role) {
       return reply.status(403).send({ message: 'Access denied' });
     }
+    if (role === 'admin') {
+      return reply.send(enhancedCourse);
+    }
 
-    // Course sudah PUBLISHED, semua boleh lihat
-    return reply.send(course);
-  } catch (error) {
-    console.error(error);
-    return reply.status(500).send({ message: 'Internal Server Error' });
+    // Cek kepemilikan Teacher (BFF masih butuh Prisma untuk ini)
+    if (role === 'teacher') {
+      const teacher = await prisma.teacher.findUnique({ where: { authId } });
+      if (teacher && teacher.id === course.teacherId) {
+        return reply.send(enhancedCourse);
+      }
+    }
+
+    // Cek kepemilikan Student (via Payment-service)
+    const { isEnrolled } = await checkEnrollmentService(authId, course.id);
+    if (isEnrolled && !isArchived) {
+      return reply.send(enhancedCourse);
+    }
+
+    return reply.status(404).send({ message: 'Course not found' });
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in getCourseByIdController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message === 'Course not found') {
+        return reply.status(404).send({ message: 'Course not found' });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
 
+// ✅ 
 export const getCoursesByTeacherIdController = async (
   req: FastifyRequest,
   reply: FastifyReply
@@ -311,136 +396,8 @@ export const getCoursesByTeacherIdController = async (
   }
 };
 
-export const getAllCoursesByCategoryController = async (
-  req: FastifyRequest,
-  reply: FastifyReply
-) => {
-  try {
-    const query = req.query as { query: string };
 
-    let isAdmin = false;
-
-    // 1. Validasi apakah query cocok dengan public schema
-    const parsedPublic = publicCourseQuerySchema.safeParse(query);
-    console.log('PARSE FILTER:PUB : ', parsedPublic);
-    if (!parsedPublic.success) {
-      // 2. Jika bukan akses publik, validasi token
-      const cleanInput = req.cookies?.accessToken;
-      const token = cleanInput;
-      if (!token) {
-        return reply.status(404).send({
-          message:
-            'Oopsie! The page took a little vacation.  Let’s get you back on track.',
-        });
-      }
-
-      const decoded = verifyToken(token);
-      if (!decoded || decoded.role !== 'admin') {
-        return reply.status(404).send({
-          message:
-            'You’ve discovered a secret place... oh wait, it’s just a missing page.',
-        });
-      }
-
-      isAdmin = true;
-
-      // 3. Validasi query sebagai admin
-      const parsedAdmin = adminCourseQuerySchema.safeParse(query);
-      console.log('PARSE FILTER:ADM : ', parsedAdmin);
-      if (!parsedAdmin.success) {
-        return reply.status(400).send({
-          message: 'Oops! Looks like you’ve wandered off the map.',
-          details: parsedAdmin.error.flatten(),
-        });
-      }
-    }
-
-    const filters = parseQueryParams(query);
-    const result = await getAllCoursesByCategoryService({
-      filters,
-      page: DEFAULT_PAGE,
-      limit: DEFAULT_LIMIT,
-    });
-
-    return reply.code(200).send(result);
-  } catch (err) {
-    if (err instanceof ZodError) {
-      return reply.status(400).send({
-        message: 'Oops! Looks like you’ve wandered off the map...',
-        details: err.flatten(),
-      });
-    }
-
-    console.error('Error in getAllCoursesController:', err);
-    return reply.status(500).send({ message: 'Internal Server Error' });
-  }
-};
-
-export const getAllCoursesByTagController = async (
-  req: FastifyRequest,
-  reply: FastifyReply
-) => {
-  try {
-    console.log('RAW QUERY:', req.query as { query: string });
-    const query = req.query as { query: string };
-    console.log('FILTERS-sanitized:', query);
-    let isAdmin = false;
-
-    // 1. Validasi apakah query cocok dengan public schema
-    const parsedPublic = publicCourseQuerySchema.safeParse(query);
-    console.log('PARSE FILTER:PUB : ', parsedPublic);
-    if (!parsedPublic.success) {
-      // 2. Jika bukan akses publik, validasi token
-      const token = req.cookies?.accessToken;
-      if (!token) {
-        return reply.status(404).send({
-          message:
-            'Oopsie! The page took a little vacation.  Let’s get you back on track.',
-        });
-      }
-
-      const decoded = verifyToken(token);
-      if (!decoded || decoded.role !== 'admin') {
-        return reply.status(404).send({
-          message:
-            'You’ve discovered a secret place... oh wait, it’s just a missing page.',
-        });
-      }
-
-      isAdmin = true;
-
-      // 3. Validasi query sebagai admin
-      const parsedAdmin = adminCourseQuerySchema.safeParse(query);
-      console.log('PARSE FILTER:ADM : ', parsedAdmin);
-      if (!parsedAdmin.success) {
-        return reply.status(400).send({
-          message: 'Oops! Looks like you’ve wandered off the map.',
-          details: parsedAdmin.error.flatten(),
-        });
-      }
-    }
-
-    const filters = parseQueryParams(query); // jika mau, bisa pakai parsedPublic.data atau parsedAdmin.data
-    const result = await getAllCoursesByTagService({
-      filters,
-      page: DEFAULT_PAGE,
-      limit: DEFAULT_LIMIT,
-    });
-    console.log('FILTERS:', filters);
-    return reply.code(200).send(result);
-  } catch (err) {
-    if (err instanceof ZodError) {
-      return reply.status(400).send({
-        message: 'Oops! Looks like you’ve wandered off the map...',
-        details: err.flatten(),
-      });
-    }
-
-    console.error('Error in getAllCoursesController:', err);
-    return reply.status(500).send({ message: 'Internal Server Error' });
-  }
-};
-
+// ✅
 export const createCourseController = async (
   req: FastifyRequest,
   reply: FastifyReply
@@ -479,7 +436,7 @@ export const createCourseController = async (
   }
 };
 
-// ✅ --- FUNGSI INI SEKARANG DIPERBAIKI ---
+// ✅
 export const updateCourseController = async (
   req: FastifyRequest,
   reply: FastifyReply
@@ -509,14 +466,6 @@ export const updateCourseController = async (
       return reply.code(404).send({ message: 'Course not found' });
     }
 
-     // ✅ Validasi: hanya teacher yg punya course & status tertentu boleh update
-    const allowedStatuses = ['DRAFT', 'INCOMPLETE', 'FOLLOWED_UP'];
-    if (!allowedStatuses.includes(course.status)) {
-      return reply.code(403).send({
-        message: `You cannot update a course in ${course.status} status.`,
-      });
-    }
-
     const teacher = await prisma.teacher.findUnique({
       where: { authId: user.id },
     });
@@ -531,9 +480,15 @@ export const updateCourseController = async (
     }
 
     // 4. ✅ PERBAIKAN BUG: JANGAN buat slug baru
-    // ⛔️ HAPUS: dataResult.slug = generateCourseSlug(dataResult.title, user.username);
-    // Go service akan mengabaikan slug, kita hanya kirim data.
-    
+    //    Hanya admin yang bisa mengedit kursus yang sudah diproses
+    if (user.role !== 'admin') {
+      const allowedStatuses = ['DRAFT', 'INCOMPLETE', 'FOLLOWED_UP', 'REJECTED'];
+      if (!allowedStatuses.includes(course.status)) {
+        return reply.code(403).send({
+          message: `You cannot update a course in ${course.status} status.`,
+        });
+      }
+    }
     // 5. Panggil Go service "bodoh"
     const updated = await updateCourseService(
       course.id, // 👈 Kirim ID (UUID)
@@ -563,12 +518,12 @@ export const updateCourseStatusController = async (
   reply: FastifyReply
 ) => {
   try {
-    const cleanStatus = sanitizeInput(req.body as { status: CourseStatus });
+    const cleanStatus = sanitizeInput(req.body as { status: EnumCourseStatus });
     const { slug } = req.params as { slug: string };
     const { status } = cleanStatus;
 
     // Validasi status
-    if (!Object.keys(CourseStatus).includes(status)) {
+    if (!Object.keys(EnumCourseStatus).includes(status)) {
       return reply.code(400).send({ message: 'Invalid course status' });
     }
 
@@ -585,94 +540,190 @@ export const updateCourseStatusController = async (
   }
 };
 
+// ✅ 
 export const updateCourseStatusControllerPub = async (
   req: FastifyRequest<{
     Params: { courseId: string };
-    Body: { status: CourseStatus };
+    Body: { status: EnumCourseStatus }; 
   }>,
   reply: FastifyReply
 ) => {
   try {
-    const { courseId } = req.params as { courseId: string };
-    const { status } = sanitizeInput(req.body);
-    const course = await prisma.course.findUnique({ where: { id: courseId } });
-
-    if (!course) {
-      return reply.status(404).send({ message: 'Course not found' });
-    }
-    if (!Object.values(CourseStatus).includes(status)) {
+    const { courseId } = req.params;
+    const { status } = req.body;
+    
+    // 1. Validasi Input (Logika Bisnis BFF)
+    if (!Object.values(EnumCourseStatus).includes(status)) {
       return reply.status(400).send({ message: 'Invalid status value' });
     }
 
+    // 2. Ambil User (Logika Bisnis BFF)
     const user = (req as any).user;
-    const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
-    const editableStatuses = ['DRAFT', 'INCOMPLETE', 'FOLLOWED_UP'];
-    const isEditable =
-      course && editableStatuses.includes(course.status) && isOwner;
+    if (!user || !user.id) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
 
-    if (!isEditable) {
+    // 3. Validasi Kepemilikan (Logika Bisnis BFF)
+    // (Penting! Hanya pemilik atau admin yang boleh ubah status)
+    const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
+    if (!isOwner) {
       return reply.status(403).send({ message: 'Access Denied.' });
     }
-    const updated = await updateCourseStatusById(courseId, status);
+
+    // 4. Panggil Go service "bodoh"
+    const updated = await updateCourseStatusByIdService(
+      courseId, 
+      status, 
+      user.id
+    );
+
     if (!updated) {
       return reply.status(404).send({ message: 'Course not found' });
     }
 
     return reply.status(200).send(updated);
-  } catch (err) {
+  } catch (err: unknown) {
+    // ... (Error handling yang aman) ...
     console.error('❌ updateCourseStatusController error:', err);
-    return reply.status(500).send({ message: 'Failed to update status' });
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
 
-export const unpublishCourseController = async (
+// ✅ 
+export const getCoursesITeachController = async (
   req: FastifyRequest,
   reply: FastifyReply
 ) => {
-  const { slug } = req.params as { slug: string };
-
   try {
-    const updated = await updateCourseStatusService(slug, 'UNPUBLISHED');
-    if (!updated) {
-      return reply.code(404).send({ message: 'Course not found' });
+    const user = (req as any).user;
+    if (!user || !user.id) {
+      return reply.status(401).send({ error: 'Unauthorized' });
+    }
+    
+    // 1. Tukar "Paspor" (AuthID) dengan "Profil" (TeacherID)
+    //    (BFF masih butuh Prisma untuk ini)
+    const teacher = await prisma.teacher.findUnique({
+      where: { authId: user.id },
+    });
+    if (!teacher) {
+      return reply.status(404).send({ message: 'Teacher not found' });
     }
 
-    return reply.code(200).send(updated);
-  } catch (err) {
-    console.error('Unpublish error:', err);
-    return reply.code(500).send({ message: 'Failed to unpublish course' });
+    // 2. Panggil Go service "bodoh"
+    const courses: CourseFromGo[] = await getCoursesITeachService(
+      { teacherId: teacher.id },
+      user.id // Kirim "Paspor" untuk otorisasi di Go
+    );
+
+    // 3. Lakukan "Enrichment" (Hitung total, dll.)
+    const enhancedCourses = courses.map((course) => ({
+      ...course,
+      totalChapters: course.chapters ? course.chapters.length : 0,
+      totalLessons: course.chapters
+        ? course.chapters.reduce(
+            (sum: number, chapter: ChapterFromGo) => {
+              return sum + (chapter.lessons ? chapter.lessons.length : 0);
+            }, 0)
+        : 0,
+      statusDescription:
+        statusDescriptions[course.status] || course.status,
+    }));
+
+    return reply.send(enhancedCourses);
+  } catch (err: unknown) {
+    // ... (Error handling yang aman) ...
+    console.error('Error in getCoursesITeachController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
 
+// export const unpublishCourseController = async (
+//   req: FastifyRequest,
+//   reply: FastifyReply
+// ) => {
+//   const { slug } = req.params as { slug: string };
+
+//   try {
+//     const updated = await updateCourseStatusService(slug, 'UNPUBLISHED');
+//     if (!updated) {
+//       return reply.code(404).send({ message: 'Course not found' });
+//     }
+
+//     return reply.code(200).send(updated);
+//   } catch (err) {
+//     console.error('Unpublish error:', err);
+//     return reply.code(500).send({ message: 'Failed to unpublish course' });
+//   }
+// };
+
+// ✅ 
 export const updateCourseTagsController = async (
   req: FastifyRequest,
   reply: FastifyReply
 ) => {
   try {
-    const cleanTag = req.body as { tagIds: string[] };
     const { slug } = req.params as { slug: string };
-    const { tagIds } = cleanTag;
+    const { tagIds } = req.body as { tagIds: string[] };
 
-    if (!slug) {
-      return reply.status(400).send({ message: 'slug is required' });
-    }
-
+    // 1. Validasi Input (Logika Bisnis BFF)
     if (!Array.isArray(tagIds)) {
       return reply.status(400).send({ message: 'tagIds must be an array' });
     }
 
+    // 2. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
+
+    // 3. Validasi Kepemilikan (Logika Bisnis BFF)
     const course = await prisma.course.findUnique({ where: { slug } });
     if (!course) {
       return reply.status(404).send({ message: 'Course not found' });
     }
+    
+    const isOwner = await validateCourseOwnership(user.id, course.id, user.role);
+    if (!isOwner) {
+       return reply.status(403).send({ message: 'Access Denied.' });
+    }
 
-    const updated = await updateCourseTagsService(course.id, tagIds);
-    return reply.code(200).send(updated);
-  } catch (err) {
-    console.error('Error updating course tags:', err);
-    return reply.status(500).send({ message: 'Failed to update tags' });
+    // 4. Panggil Go service "bodoh"
+    const result = await updateCourseTagsService(course.id, tagIds, user.id);
+    return reply.code(200).send(result);
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in updateCourseTagsController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
+
 
 export const updateCoursePriceController = async (
   req: FastifyRequest,
@@ -696,34 +747,3 @@ export const updateCoursePriceController = async (
   }
 };
 
-export const getCoursesITeachController = async (
-  req: FastifyRequest,
-  reply: FastifyReply
-) => {
-  try {
-    const user = (req as any).user;
-
-    if (!user || !user.id) {
-      return reply.status(401).send({ error: 'Unauthorized' });
-    }
-    const teacher = await prisma.teacher.findUnique({
-      where: { authId: user.id },
-    });
-    if (!teacher) {
-      return reply.status(404).send({ message: 'Teacher not found' });
-    }
-    console.log('sdxjgh', teacher.id);
-    const courses = await getCoursesITeachService({
-      teacherId: teacher.id,
-    });
-
-    if (!courses) {
-      return reply.status(404).send({ message: 'Course not found' });
-    }
-    console.log('sdxjgh2', courses);
-    return reply.send(courses);
-  } catch (error) {
-    console.error('Error fetching courses I teach:', error);
-    return reply.status(500).send({ error: 'Internal Server Error' });
-  }
-};

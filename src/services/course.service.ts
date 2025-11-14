@@ -30,12 +30,6 @@ interface LessonFromGo {
   isPreview: boolean;
   duration: number;
 }
-interface ChapterFromGo {
-  id: string;
-  title: string;
-  order: number;
-  lessons: LessonFromGo[] | null;
-}
 interface TeacherFromGo {
   id: string;
   name: string;
@@ -45,6 +39,23 @@ interface CategoryFromGo {
   id: string;
   name: string;
   slug: string;
+}
+
+interface GoPaginationResponse {
+  data: CourseFromGo[];
+  pagination: {
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+  };
+}
+
+export interface ChapterFromGo {
+  id: string;
+  title: string;
+  order: number;
+  lessons: LessonFromGo[] | null;
 }
 
 export interface CourseFromGo {
@@ -79,58 +90,76 @@ const apiClient: AxiosInstance = axios.create({
   },
 });
 
+
+// ⬜⬜⬜ ✔
 export const getAllCoursesService = async ({
   filters,
   page,
   limit,
-}: GetAllCoursesParams) => {
+}: GetAllCoursesParams): Promise<GoPaginationResponse> => {
   try {
-    const offset = (page - 1) * limit;
+    // 1. Siapkan query params
+    const params = new URLSearchParams();
+    params.append('page', page.toString());
+    params.append('limit', limit.toString());
 
-    const [courses, totalCourses] = await Promise.all([
-      prisma.course.findMany({
-        where: filters,
-        orderBy: { createdAt: 'desc' },
-        skip: offset,
-        take: limit,
-        include: {
-          teacher: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-            },
-          },
-          categories: {
-            select: {
-              id: true,
-              name: true,
-            },
-          },
-          tags: {
-            select: {
-              id: true,
-              name: true,
-            },
-          },
-          reviews: true,
-        },
-      }),
-      prisma.course.count({ where: filters }),
-    ]);
+    // 2. Terapkan filter dinamis
+    if (filters.status) {
+      if (Array.isArray(filters.status)) {
+        filters.status.forEach((s: string) => params.append('status', s));
+      } else {
+        params.append('status', filters.status);
+      }
+    }
+    if (filters.level) {
+      if (Array.isArray(filters.level)) {
+        filters.level.forEach((l: string) => params.append('level', l));
+      } else {
+        params.append('level', filters.level);
+      }
+    }
+    
+    // Tambahkan filter Kategori & Tag (jika ada)
+    // BFF meneruskan filter ini ke Go service
+    if (filters.category) {
+      if (Array.isArray(filters.category)) {
+        filters.category.forEach((c: string) => params.append('category', c));
+      } else {
+        params.append('category', filters.category);
+      }
+    }
+    if (filters.tag) {
+       if (Array.isArray(filters.tag)) {
+        filters.tag.forEach((t: string) => params.append('tag', t));
+      } else {
+        params.append('tag', filters.tag);
+      }
+    }
 
-    const totalPages = Math.ceil(totalCourses / limit);
 
-    return {
-      data: courses,
-      page,
-      limit,
-      totalCourses,
-      totalPages,
-    };
-  } catch (err) {
-    console.error('Error in getAllCoursesService:', err);
-    throw new Error('Failed to get all courses');
+    // 3. Panggil endpoint Go
+    const response = await apiClient.get<GoPaginationResponse>(
+      '/internal/courses',
+      { params: params } 
+    );
+
+    return response.data; // Kembalikan { data: [...], pagination: {...} }
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in getAllCoursesService (BFF):',
+        err.response?.data || err.message
+      );
+      const message = err.response?.data?.error || 'Failed to get all courses';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in getAllCoursesService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in getAllCoursesService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
   }
 };
 
@@ -147,142 +176,8 @@ export const getCoursesByTeacherIdService = async (teacherId: string) => {
   });
 };
 
-export const getAllCoursesByCategoryService = async ({
-  filters,
-  page,
-  limit,
-}: GetAllCoursesParams) => {
-  try {
-    const { status, level, categorySlug, subCategorySlug } = filters;
 
-    const where: any = {};
-
-    if (status) where.status = status;
-    if (level) where.level = level;
-
-    if (categorySlug || subCategorySlug) {
-      where.categories = {
-        some: {
-          ...(subCategorySlug
-            ? { slug: subCategorySlug }
-            : { parent: { slug: categorySlug } }),
-        },
-      };
-    }
-
-    const skip = (page - 1) * limit;
-
-    const [courses, totalCourses] = await Promise.all([
-      prisma.course.findMany({
-        where,
-        orderBy: { createdAt: 'desc' },
-        skip,
-        take: limit,
-        include: {
-          categories: {
-            include: {
-              children: true,
-              parent: true,
-            },
-          },
-          teacher: {
-            select: {
-              id: true,
-              name: true,
-              username: true,
-            },
-          },
-          tags: {
-            select: {
-              id: true,
-              name: true,
-            },
-          },
-          reviews: true,
-        },
-      }),
-
-      prisma.course.count({ where }),
-    ]);
-
-    const totalPages = Math.ceil(totalCourses / limit);
-
-    return {
-      data: courses,
-      page,
-      limit,
-      totalPages,
-      totalCourses,
-    };
-  } catch (err) {
-    console.error('Error in getAllCoursesByCategoryService:', err);
-    throw new Error('Failed to get all courses');
-  }
-};
-
-export const getAllCoursesByTagService = async ({
-  filters,
-  page,
-  limit,
-}: GetAllCoursesParams) => {
-  try {
-    const { status, level, tag } = filters;
-
-    const where: any = {};
-
-    // Filter status dan level
-    if (status) where.status = status;
-    if (level) where.level = level;
-    if (tag) {
-      where.tags = {
-        some: {
-          slug: tag,
-        },
-      };
-    }
-
-    const [courses, totalCourses] = await Promise.all([
-      prisma.course.findMany({
-        where,
-        skip: (page - 1) * limit,
-        take: limit,
-        orderBy: { createdAt: 'desc' },
-        include: {
-          tags: {
-            select: {
-              id: true,
-              name: true,
-              slug: true,
-            },
-          },
-          categories: {
-            select: {
-              name: true,
-              slug: true,
-            },
-          },
-          reviews: true,
-        },
-      }),
-
-      prisma.course.count({ where }),
-    ]);
-
-    const totalPages = Math.ceil(totalCourses / limit);
-
-    return {
-      data: courses,
-      page,
-      limit,
-      totalPages,
-      totalCourses,
-    };
-  } catch (err) {
-    console.error('Error in getAllCoursesByTagService:', err);
-    throw new Error('Failed to get all courses');
-  }
-};
-// ⬜⬜⬜ bySlug
+// ⬜⬜⬜ ✔
 export const getCourseBySlugService = async (
   slug: string
 ): Promise<CourseFromGo> => {
@@ -312,88 +207,40 @@ export const getCourseBySlugService = async (
   }
 };
 
-export const getCourseByIdService = async (courseId: string) => {
+// --- ⬜⬜⬜ ✔
+export const getCourseByIdService = async (
+  courseId: string
+): Promise<CourseFromGo> => {
   try {
-    const course = await prisma.course.findUnique({
-      where: { id: courseId },
-      include: {
-        teacher: {
-          select: {
-            id: true,
-            name: true,
-            username: true,
-          },
-        },
-        categories: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-        tags: {
-          select: {
-            id: true,
-            name: true,
-          },
-        },
-        chapters: {
-          orderBy: { order: 'asc' },
-          include: {
-            lessons: {
-              orderBy: { order: 'asc' },
-            },
-            _count: {
-              select: {
-                lessons: true,
-              },
-            },
-          },
-        },
-        reviews: {
-          select: {
-            rating: true,
-            comment: true,
-            student: {
-              select: {
-                id: true,
-                name: true,
-                username: true,
-              },
-            },
-          },
-        },
-        _count: {
-          select: {
-            chapters: true,
-          },
-        },
-      },
-    });
-
-    if (!course) {
-      throw new Error('Course not found');
-    }
-    const totalLessons = course.chapters.reduce(
-      (sum, chapter) => sum + chapter._count.lessons,
-      0
+    // Panggil endpoint Go yang baru saja kita buat
+    const response = await apiClient.get<CourseFromGo>(
+      `/internal/courses/${courseId}`
     );
-    const description = statusDescriptions[course.status];
-    // Merge manual field totalChapters to returned course object
-    return {
-      ...course,
-      totalChapters: course._count.chapters,
-      totalLessons,
-      statusDescription: description,
-    };
-  } catch (err) {
-    console.error('Error in getCourseByIdService:', err);
-    throw new Error('Failed to get course by id');
+    return response.data;
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in getCourseByIdService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 404) {
+        throw new Error('Course not found');
+      }
+      const message = err.response?.data?.error || 'Failed to get course by id';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in getCourseByIdService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in getCourseByIdService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
   }
 };
 
-// --- ⬜⬜⬜ FUNGSI INI AKAN KITA REFACTOR SEKARANG ---
+// --- ⬜⬜⬜ ✔
 export const createCourseService = async (
-  data: CreateCourseInput, // ✅ PERBAIKAN: Gunakan tipe input dari Zod
+  data: CreateCourseInput,
   authId: string
 ): Promise<CourseFromGo> => {
   try {
@@ -419,6 +266,7 @@ export const createCourseService = async (
   }
 };
 
+// ⬜⬜⬜ ✔
 export const updateCourseService = async (
   courseId: string,
   data: UpdateCourseInput, // Tipe Zod (dari controller)
@@ -487,48 +335,90 @@ export const updateCourseStatusService = async (
   }
 };
 
-// path: services/course.service.ts
-
-export const updateCourseStatusById = async (
+// ⬜⬜⬜ ✔
+// (Menggantikan fungsi 'updateCourseStatusById' lama yang berbasis Prisma)
+export const updateCourseStatusByIdService = async (
   courseId: string,
-  status: CourseStatus
-) => {
+  status: EnumCourseStatus, // Menggunakan Tipe Enum dari Prisma
+  authId: string
+): Promise<CourseFromGo> => {
   try {
-    const updated = await prisma.course.update({
-      where: { id: courseId },
-      data: { status },
-    });
-    return updated;
-  } catch (error) {
-    if (
-      error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === 'P2025'
-    ) {
-      return null;
+    // Panggil endpoint Go yang sudah kita siapkan
+    const response = await apiClient.patch<CourseFromGo>(
+      `/internal/courses/${courseId}/status`,
+      { status: status }, // Body: { "status": "PUBLISHED" }
+      {
+        headers: {
+          'X-Authenticated-User-ID': authId,
+        },
+      }
+    );
+    return response.data;
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in updateCourseStatusByIdService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You do not own this course');
+      }
+      if (err.response?.status === 404) {
+        throw new Error('Course not found');
+      }
+      const message = err.response?.data?.error || 'Failed to update status';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in updateCourseStatusByIdService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in updateCourseStatusByIdService (BFF):', err);
+      throw new Error('An unknown error occurred');
     }
-    throw error;
   }
 };
 
+// ⬜⬜⬜ ✔
 export const updateCourseTagsService = async (
   courseId: string,
-  tagIds: string[]
-) => {
-  if (!courseId) throw new Error('Course ID is required');
-
-  const course = await prisma.course.findUnique({ where: { id: courseId } });
-  if (!course) throw new Error('Course not found');
-
-  return prisma.course.update({
-    where: { id: courseId },
-    data: {
-      tags: {
-        set: [], // remove existing tags
-        connect: tagIds.map((id) => ({ id })), // add new ones
-      },
-    },
-    include: { tags: true }, // optional: return tags data
-  });
+  tagIds: string[],
+  authId: string
+): Promise<{ message: string }> => { // Go service mengembalikan pesan sukses
+  try {
+    const response = await apiClient.patch<{ message: string }>(
+      `/internal/courses/${courseId}/tags`,
+      { tagIds: tagIds }, // Body: { "tagIds": ["uuid1", "uuid2"] }
+      {
+        headers: {
+          'X-Authenticated-User-ID': authId,
+        },
+      }
+    );
+    return response.data;
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in updateCourseTagsService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You do not own this course');
+      }
+      if (err.response?.status === 404) {
+        throw new Error('Course not found');
+      }
+      const message = err.response?.data?.error || 'Failed to update tags';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in updateCourseTagsService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in updateCourseTagsService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
+  }
 };
 
 export const updateCoursePriceService = async (slug: string, price: number) => {
@@ -557,46 +447,40 @@ interface GetCoursesITeachParams {
   teacherId: string;
 }
 
-export const getCoursesITeachService = async ({
-  teacherId,
-}: GetCoursesITeachParams) => {
-  const courses = await prisma.course.findMany({
-    where: {
-      teacherId,
-    },
-    include: {
-      categories: true,
-      chapters: {
-        select: {
-          id: true,
-        },
-      },
-      teacher: {
-        select: {
-          id: true,
-          name: true,
-          username: true,
-        },
-      },
-    },
-    orderBy: {
-      createdAt: 'desc',
-    },
-  });
 
-  return courses.map((course) => ({
-    id: course.id,
-    title: course.title,
-    slug: course.slug,
-    description: course.description,
-    thumbnail: course.thumbnail,
-    price: course.price,
-    level: course.level,
-    status: course.status,
-    categories: course.categories,
-    totalChapters: course.chapters.length,
-    createdAt: course.createdAt,
-    updatedAt: course.updatedAt,
-    teacher: course.teacher,
-  }));
+// ⬜⬜⬜✔
+export const getCoursesITeachService = async (
+  { teacherId }: { teacherId: string },
+  authId: string // "Paspor"
+): Promise<CourseFromGo[]> => {
+  try {
+    // Panggil endpoint Go yang baru
+    const response = await apiClient.get<CourseFromGo[]>(
+      `/internal/teachers/${teacherId}/courses`, // Gunakan ID Profil
+      {
+        headers: {
+          'X-Authenticated-User-ID': authId, // Kirim "Paspor" untuk otorisasi
+        },
+      }
+    );
+    return response.data;
+  } catch (err: unknown) {
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in getCoursesITeachService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You can only view your own courses');
+      }
+      const message = err.response?.data?.error || 'Failed to get courses';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in getCoursesITeachService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in getCoursesITeachService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
+  }
 };

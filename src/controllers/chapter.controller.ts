@@ -7,10 +7,7 @@ import {
   updateChapterService,
   deleteChapterService,
 } from '../services/chapter.service';
-import {
-  validateCourseOwnership,
-  validateUserEnrollment,
-} from '../utils/validateAccess';
+import { validateCourseOwnership } from '../utils/validateAccess';
 import { prisma } from '../utils/prisma';
 import sanitizeInput from '../utils/xInputSanitize';
 
@@ -114,8 +111,8 @@ export const updateChapterController = async (
 };
 
 const createChapterSchema = z.object({
-  title: z.string().min(8).optional(),
-  order: z.number().optional(),
+  title: z.string().min(8, 'Title must be at least 8 characters long'),
+  order: z.number().int().optional().default(0),
 });
 
 const reorderChapterSchema = z.object({
@@ -128,22 +125,58 @@ const reorderChapterSchema = z.object({
 });
 
 export const addChapterToCourseController = async (
-  req: FastifyRequest<{ Params: { courseId: string }; Body: unknown }>,
+  req: FastifyRequest,
   reply: FastifyReply
 ) => {
-  const parse = createChapterSchema.safeParse(sanitizeInput(req.body));
-  if (!parse.success)
-    return reply.status(400).send({ error: parse.error.flatten() });
+  try {
+    const { courseId } = req.params as { courseId: string };
 
-  const user = (req as any).user;
-  const { courseId } = req.params;
-  const { title, order } = parse.data;
+    // 1. Validasi Input (Logika Bisnis BFF)
+    const result = createChapterSchema.safeParse(req.body);
+    if (!result.success) {
+      return reply
+        .status(400)
+        .send({ message: 'Invalid input', errors: result.error.flatten() });
+    }
+    const data = result.data; // { title, order }
 
-  const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
-  if (!isOwner) return reply.status(403).send({ message: 'Unauthorized' });
+    // 2. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id || !user.role) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
 
-  const newChapter = await createChapterService(courseId, title, order);
-  reply.code(201).send(newChapter);
+    // 3. Validasi Kepemilikan (Logika Bisnis "Pintar" BFF)
+    //    BFF (Fastify) memanggil Prisma untuk memastikan
+    //    user ini adalah pemilik kursus SEBELUM memanggil service Go.
+    const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
+    if (!isOwner) {
+      return reply.status(403).send({ message: 'Access Denied.' });
+    }
+    
+    // 4. Panggil Go service "bodoh" (via service axios)
+    const newChapter = await createChapterService(
+      courseId,
+      data,
+      user.id // Kirim "Paspor"
+    );
+
+    return reply.status(201).send(newChapter);
+
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in addChapterToCourseController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
+  }
 };
 
 /**

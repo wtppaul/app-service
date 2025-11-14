@@ -1,8 +1,10 @@
+import axios, { AxiosInstance } from 'axios';
 import { prisma } from '../utils/prisma';
 import { z } from 'zod';
 import { generateChapterSlug } from '../utils/slug';
 import { nanoid } from 'nanoid';
 import { Prisma } from '../../generated/prisma';
+import { Chapter } from '../../generated/prisma';
 
 type NewLesson = {
   title: string;
@@ -33,6 +35,28 @@ const createChapterWithLessonsSchema = z.object({
       })
     )
     .optional(),
+});
+
+
+interface CreateChapterInput {
+  title: string;
+  order: number;
+}
+
+// Tipe output (sesuai struct 'Chapter' di Go)
+// (Kita bisa menggunakan tipe 'Chapter' dari Prisma jika cocok)
+type ChapterFromGo = Chapter;
+
+const COURSE_SERVICE_URL =
+  process.env.COURSE_SERVICE_URL || 'http://course-service:8083';
+const INTERNAL_SECRET = process.env.INTERNAL_API_SECRET;
+
+const apiClient: AxiosInstance = axios.create({
+  baseURL: COURSE_SERVICE_URL,
+  headers: {
+    'Content-Type': 'application/json',
+    'X-Internal-Secret': INTERNAL_SECRET,
+  },
 });
 
 export const createChapterWithLessonsService2BCKPori = async (
@@ -255,55 +279,45 @@ export const createChapterWithLessonsService = async (
 
 export const createChapterService = async (
   courseId: string,
-  rawTitle?: string,
-  order?: number,
-  lessons?: NewLesson[]
-) => {
-  const course = await prisma.course.findUnique({
-    where: { id: courseId },
-    select: { slug: true },
-  });
-
-  if (!course) {
-    throw new Error('Course not found');
+  data: CreateChapterInput,
+  authId: string // "Paspor"
+): Promise<ChapterFromGo> => {
+  try {
+    // Panggil endpoint Go yang baru saja Anda buat
+    const response = await apiClient.post<ChapterFromGo>(
+      `/internal/courses/${courseId}/chapters`, // POST /internal/courses/:courseId/chapters
+      data, // { "title": "...", "order": ... }
+      {
+        headers: {
+          // Kirim "Paspor" agar handler Go bisa menerimanya
+          'X-Authenticated-User-ID': authId,
+        },
+      }
+    );
+    return response.data;
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in createChapterService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You do not own this course');
+      }
+      if (err.response?.status === 404) {
+        throw new Error('Course not found');
+      }
+      const message = err.response?.data?.error || 'Failed to create chapter';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in createChapterService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in createChapterService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
   }
-
-  const count = await prisma.chapter.count({ where: { courseId } });
-
-  // Gunakan `order` jika dikirim, kalau tidak pakai `count`
-  // const finalOrder = typeof order === 'number' ? order : count;
-  const finalOrder = count;
-
-  // Judul chapter pakai finalOrder + 1 (untuk tampilannya)
-  const chapterNumber = finalOrder + 1;
-
-  // Slug auto dengan nomor + random string
-  const randomSuffix = nanoid(4).toLowerCase();
-  const slug = `${course.slug}-chapter-${chapterNumber}-${randomSuffix}`;
-
-  const title = `Chapter ${chapterNumber}: ${rawTitle}`;
-
-  return prisma.chapter.create({
-    data: {
-      title,
-      slug,
-      courseId,
-      order: finalOrder,
-      lessons: lessons?.length
-        ? {
-            create: lessons.map((l) => ({
-              title: l.title,
-              playbackId: l.playbackId,
-              duration: l.duration,
-              order: l.order,
-            })),
-          }
-        : undefined,
-    },
-    include: {
-      lessons: true,
-    },
-  });
 };
 
 export const updateChapterService = async ({
