@@ -37,11 +37,26 @@ const createChapterWithLessonsSchema = z.object({
     .optional(),
 });
 
+export const reorderChaptersSchema = z.array(
+  z.object({
+    id: z.string().uuid(),
+    order: z.number().int(),
+  })
+);
+type ReorderChaptersInput = z.infer<typeof reorderChaptersSchema>;
 
 interface CreateChapterInput {
   title: string;
   order: number;
 }
+// (Kita definisikan skema Zod di sini untuk validasi input service)
+export const updateChapterSchema = z.object({
+  title: z.string().min(8).optional(),
+  order: z.number().int().optional(),
+});
+
+// Buat Tipe TypeScript dari skema Zod
+type UpdateChapterInput = z.infer<typeof updateChapterSchema>;
 
 // Tipe output (sesuai struct 'Chapter' di Go)
 // (Kita bisa menggunakan tipe 'Chapter' dari Prisma jika cocok)
@@ -277,6 +292,7 @@ export const createChapterWithLessonsService = async (
   return chapter;
 };
 
+// ✅
 export const createChapterService = async (
   courseId: string,
   data: CreateChapterInput,
@@ -320,146 +336,143 @@ export const createChapterService = async (
   }
 };
 
-export const updateChapterService = async ({
-  courseId,
-  chapterId,
-  rawTitle,
-  order,
-}: {
-  courseId: string;
-  chapterId: string;
-  rawTitle?: string;
-  order?: number;
-}) => {
-  const chapter = await prisma.chapter.findUnique({
-    where: { id: chapterId },
-    include: { course: { select: { slug: true } } },
-  });
-
-  if (!chapter || chapter.courseId !== courseId) {
-    throw new Error('Chapter not found or course mismatch');
+// ✅
+export const updateChapterService = async (
+  courseId: string,
+  chapterId: string,
+  data: UpdateChapterInput, // Menggunakan tipe Zod
+  authId: string // "Paspor"
+): Promise<ChapterFromGo> => {
+  try {
+    // Panggil endpoint Go yang baru saja Anda buat
+    const response = await apiClient.patch<ChapterFromGo>(
+      `/internal/courses/${courseId}/chapters/${chapterId}`, // PATCH /internal/courses/:courseId/chapters/:chapterId
+      data, // { "title": "...", "order": ... } (hanya field yang ada)
+      {
+        headers: {
+          'X-Authenticated-User-ID': authId,
+        },
+      }
+    );
+    return response.data;
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in updateChapterService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You do not own this course');
+      }
+      if (err.response?.status === 404) {
+        throw new Error('Chapter or Course not found');
+      }
+      const message = err.response?.data?.error || 'Failed to update chapter';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in updateChapterService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in updateChapterService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
   }
-
-  const updatedData: Partial<{
-    title: string;
-    slug: string;
-    order: number;
-  }> = {};
-
-  // Update order jika dikirim
-  if (typeof order === 'number') {
-    updatedData.order = order;
-  }
-
-  // Update title & slug jika rawTitle dikirim
-  if (rawTitle) {
-    const chapterNumber =
-      (typeof order === 'number' ? order : chapter.order) + 1;
-    updatedData.title = `Chapter ${chapterNumber}: ${rawTitle}`;
-
-    const randomSuffix = chapter.slug.split('-').pop() ?? '';
-    updatedData.slug = `${chapter.course.slug}-chapter-${chapterNumber}-${randomSuffix}`;
-  }
-
-  const updated = await prisma.chapter.update({
-    where: { id: chapterId },
-    data: updatedData,
-  });
-
-  return updated;
 };
 
+
+/**
+ * ✅ 
+ * Memanggil course-service (Go) untuk reorder semua Chapter
+ */
 export const reorderChaptersService = async (
   courseId: string,
-  updates: { id: string; order: number }[]
-) => {
-  // Step 1: Validasi order tidak duplikat
-  const seenOrders = new Set();
-  for (const { order } of updates) {
-    if (seenOrders.has(order)) {
-      throw new Error(`Duplicate chapter order detected: ${order}`);
+  data: ReorderChaptersInput, // Menggunakan tipe array Zod
+  authId: string // "Paspor"
+): Promise<{ message: string }> => {
+  try {
+    // Panggil endpoint Go yang baru saja Anda buat
+    const response = await apiClient.post<{ message: string }>(
+      `/internal/courses/${courseId}/chapters/reorder`, // POST /internal/courses/:courseId/chapters/reorder
+      data, // [ { "id": "uuid", "order": 1 }, ... ]
+      {
+        headers: {
+          'X-Authenticated-User-ID': authId,
+        },
+      }
+    );
+    return response.data; // { "message": "..." }
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in reorderChaptersService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You do not own this course');
+      }
+      if (err.response?.status === 404) {
+        throw new Error('Course not found');
+      }
+      // Error 400 dari Go berarti salah satu ID chapter tidak valid
+      if (err.response?.status === 400) {
+        throw new Error(err.response.data.error || 'Reorder failed: Invalid chapter data');
+      }
+      const message = err.response?.data?.error || 'Failed to reorder chapters';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in reorderChaptersService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in reorderChaptersService (BFF):', err);
+      throw new Error('An unknown error occurred');
     }
-    seenOrders.add(order);
   }
-
-  // Step 2: Ambil semua chapter terkait
-  const chapters = await prisma.chapter.findMany({
-    where: { courseId },
-    select: {
-      id: true,
-      title: true,
-    },
-  });
-
-  const course = await prisma.course.findUnique({
-    where: { id: courseId },
-    select: { slug: true },
-  });
-
-  if (!course) throw new Error('Course not found');
-
-  // Step 3: Map data untuk update
-  const chapterMap = new Map(chapters.map((ch) => [ch.id, ch.title]));
-
-  const tx = updates.map((ch) => {
-    const oldTitle = chapterMap.get(ch.id);
-    if (!oldTitle) throw new Error(`Chapter not found: ${ch.id}`);
-
-    const rawTitle = oldTitle.replace(/^Chapter\s\d+:\s/i, '').trim();
-    const newTitle = `Chapter ${ch.order + 1}: ${rawTitle}`;
-    const newSlug = `${course.slug}-chapter-${ch.order + 1}-${nanoid(
-      4
-    ).toLowerCase()}`;
-
-    return prisma.chapter.update({
-      where: { id: ch.id, courseId },
-      data: {
-        order: ch.order,
-        title: newTitle,
-        slug: newSlug,
-      },
-    });
-  });
-
-  return prisma.$transaction(tx);
 };
 
+/**
+ * ✅ 
+ * Memanggil course-service (Go) untuk menghapus Chapter
+ */
 export const deleteChapterService = async (
   courseId: string,
-  chapterId: string
-) => {
-  const chapter = await prisma.chapter.findUnique({
-    where: { id: chapterId },
-    select: { courseId: true },
-  });
-
-  if (!chapter || chapter.courseId !== courseId) {
-    throw new Error('Chapter not found or does not belong to course');
+  chapterId: string,
+  authId: string // "Paspor"
+): Promise<{ message: string }> => {
+  try {
+    // Panggil endpoint Go yang baru saja Anda buat
+    const response = await apiClient.delete<{ message: string }>(
+      `/internal/courses/${courseId}/chapters/${chapterId}`, // DELETE /internal/courses/:courseId/chapters/:chapterId
+      {
+        headers: {
+          'X-Authenticated-User-ID': authId,
+        },
+      }
+    );
+    return response.data; // { "message": "..." }
+  } catch (err: unknown) {
+    // Error handling yang aman
+    if (axios.isAxiosError(err)) {
+      console.error(
+        'Error in deleteChapterService (BFF):',
+        err.response?.data || err.message
+      );
+      if (err.response?.status === 403) {
+        throw new Error('Forbidden: You do not own this course');
+      }
+      if (err.response?.status === 404) {
+        // Ini bisa berarti Course atau Chapter tidak ditemukan
+        throw new Error(err.response.data.error || 'Chapter not found or does not belong to this course');
+      }
+      const message = err.response?.data?.error || 'Failed to delete chapter';
+      throw new Error(message);
+    } else if (err instanceof Error) {
+      console.error('Error in deleteChapterService (BFF):', err.message);
+      throw new Error(err.message);
+    } else {
+      console.error('Unknown error in deleteChapterService (BFF):', err);
+      throw new Error('An unknown error occurred');
+    }
   }
-
-  // Hapus semua lesson di dalam chapter
-  await prisma.lesson.deleteMany({
-    where: { chapterId },
-  });
-
-  // Hapus chapternya
-  await prisma.chapter.delete({
-    where: { id: chapterId },
-  });
-
-  // Ambil ulang semua chapter dari course terkait, urutkan ulang
-  const remainingChapters = await prisma.chapter.findMany({
-    where: { courseId },
-    orderBy: { order: 'asc' },
-    select: { id: true },
-  });
-
-  // Susun ulang urutan berdasarkan index sekarang
-  const updates = remainingChapters.map((ch, idx) => ({
-    id: ch.id,
-    order: idx,
-  }));
-
-  // Reorder sekaligus update slug & title
-  await reorderChaptersService(courseId, updates);
 };

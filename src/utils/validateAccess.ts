@@ -1,4 +1,7 @@
 import { prisma } from './prisma';
+import { verifyToken } from './jwt';
+import { Role } from '../../generated/prisma'; // Impor tipe Role jika ada
+
 // ⛔️ HAPUS: 'verifyToken' tidak diperlukan di file utility ini
 // import { verifyToken } from './jwt';
 
@@ -36,6 +39,73 @@ export const validateCourseOwnership = async (
 
   // 5. Validasi kepemilikan
   return course.teacherId === teacher.id;
+};
+
+
+/**
+ * ✅ --- FUNGSI BARU ---
+ * Memvalidasi apakah user adalah pemilik CHAPTER (melalui course)
+ */
+export const validateChapterOwnership = async (
+  authId: string,
+  chapterId: string,
+  role: Role | string
+) => {
+  // Admin selalu bisa akses
+  if (role === 'admin') return true;
+
+  // 1. Cari teacher berdasarkan AuthID
+  const teacher = await prisma.teacher.findUnique({
+    where: { authId },
+  });
+  if (!teacher) return false; // Bukan teacher, pasti bukan pemilik
+
+  // 2. Cari chapter DAN course induknya
+  const chapter = await prisma.chapter.findUnique({
+    where: { id: chapterId },
+    include: {
+      course: true, // Sertakan data kursus
+    },
+  });
+  if (!chapter) return false; // Chapter tidak ditemukan
+
+  // 3. Bandingkan ID pemilik kursus dengan ID teacher
+  return chapter.course.teacherId === teacher.id;
+};
+
+
+export const validateLessonOwnership = async (
+  authId: string,
+  lessonId: string,
+  role: Role | string
+) => {
+  // Admin selalu bisa akses
+  if (role === 'admin') return true;
+
+  // 1. Cari teacher berdasarkan AuthID
+  const teacher = await prisma.teacher.findUnique({
+    where: { authId },
+  });
+  if (!teacher) return false; // Bukan teacher
+
+  // 2. Cari lesson, chapter, DAN course induknya
+  //    Ini adalah 'nested include' untuk melacak ke pemilik
+  const lesson = await prisma.lesson.findUnique({
+    where: { id: lessonId },
+    include: {
+      chapter: {
+        include: {
+          course: true, // Sertakan data kursus induk
+        },
+      },
+    },
+  });
+  if (!lesson || !lesson.chapter || !lesson.chapter.course) {
+    return false; // Lesson/Chapter/Course tidak ditemukan
+  }
+
+  // 3. Bandingkan ID pemilik kursus dengan ID teacher
+  return lesson.chapter.course.teacherId === teacher.id;
 };
 
 // ⛔️ FUNGSI 'validateUserEnrollment' DIHAPUS DARI SINI.

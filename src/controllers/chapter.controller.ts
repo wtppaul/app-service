@@ -10,6 +10,11 @@ import {
 import { validateCourseOwnership } from '../utils/validateAccess';
 import { prisma } from '../utils/prisma';
 import sanitizeInput from '../utils/xInputSanitize';
+import { updateChapterSchema, reorderChaptersSchema } from '../services/chapter.service';
+import { getCourseByIdService } from '../services/course.service'; 
+import { checkEnrollmentService } from '../services/payment.service'; 
+import { CourseStatus as EnumCourseStatus } from '../../generated/prisma';
+import { CourseFromGo } from '../services/course.service';
 
 const createChapterWithLessonsSchema = z.object({
   rawTitle: z.string().min(8),
@@ -26,6 +31,20 @@ const createChapterWithLessonsSchema = z.object({
       })
     )
     .optional(),
+});
+
+const createChapterSchema = z.object({
+  title: z.string().min(8, 'Title must be at least 8 characters long'),
+  order: z.number().int().optional().default(0),
+});
+
+const reorderChapterSchema = z.object({
+  chapters: z.array(
+    z.object({
+      id: z.string(),
+      order: z.number(),
+    })
+  ),
 });
 
 export const createChapterWithLessonsController = async (
@@ -74,56 +93,70 @@ export const createChapterWithLessonsController = async (
   }
 };
 
-const updateChapterSchema = z.object({
-  rawTitle: z.string().min(8),
-  order: z.number().optional(),
-});
-
+/**
+ * ✅ 
+ * (INI ADALAH FUNGSI BFF YANG "PINTAR")
+ * Menangani pembaruan chapter.
+ * Ini adalah handler untuk: PATCH /:courseId/chapters/:chapterId
+ */
 export const updateChapterController = async (
-  req: FastifyRequest<{
-    Params: { courseId: string; chapterId: string };
-    Body: unknown;
-  }>,
+  req: FastifyRequest,
   reply: FastifyReply
 ) => {
-  const { courseId, chapterId } = req.params;
+  try {
+    const { courseId, chapterId } = req.params as { courseId: string; chapterId: string };
 
-  const parse = updateChapterSchema.safeParse(sanitizeInput(req.body));
-  if (!parse.success)
-    return reply.status(400).send({ error: parse.error.flatten() });
+    // 1. Validasi Input (Logika Bisnis BFF)
+    //    Kita gunakan skema Zod dari service
+    const result = updateChapterSchema.safeParse(req.body);
+    if (!result.success) {
+      return reply
+        .status(400)
+        .send({ message: 'Invalid input', errors: result.error.flatten() });
+    }
+    const data = result.data; // { title?, order? }
 
-  const { rawTitle, order } = parse.data;
-  const user = (req as any).user;
+    // 2. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id || !user.role) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
 
-  const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
-  if (!isOwner) {
-    return reply.status(403).send({ message: 'Unauthorized' });
+    // 3. Validasi Kepemilikan (Logika Bisnis "Pintar" BFF)
+    //    BFF (Fastify) memanggil Prisma untuk memastikan
+    //    user ini adalah pemilik kursus SEBELUM memanggil service Go.
+    const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
+    if (!isOwner) {
+      return reply.status(403).send({ message: 'Access Denied.' });
+    }
+    
+    // 4. Panggil Go service "bodoh" (via service axios)
+    const updatedChapter = await updateChapterService(
+      courseId,
+      chapterId,
+      data,
+      user.id // Kirim "Paspor"
+    );
+
+    return reply.status(200).send(updatedChapter);
+
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in updateChapterController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
-
-  const updatedChapter = await updateChapterService({
-    courseId,
-    chapterId,
-    rawTitle,
-    order,
-  });
-
-  return reply.send(updatedChapter);
 };
 
-const createChapterSchema = z.object({
-  title: z.string().min(8, 'Title must be at least 8 characters long'),
-  order: z.number().int().optional().default(0),
-});
-
-const reorderChapterSchema = z.object({
-  chapters: z.array(
-    z.object({
-      id: z.string(),
-      order: z.number(),
-    })
-  ),
-});
-
+// ✅
 export const addChapterToCourseController = async (
   req: FastifyRequest,
   reply: FastifyReply
@@ -180,82 +213,180 @@ export const addChapterToCourseController = async (
 };
 
 /**
- * api/courses/89c0c074-2268-4bae-b2c6-f58869355703/chapters/reorder
- *
- * {
- * "chapters": [
- *   { "id": "0b941c10-1cf8-4097-8af2-2eaf8acf3749", "order": 0 },
- *   { "id": "d5083662-2291-4c29-b04f-4b6237e4130f", "order": 1 }
- *	]
- *}
- *
+ * ✅
+ * (INI ADALAH FUNGSI BFF YANG "PINTAR")
+ * Menangani pembaruan urutan semua chapter.
+ * Ini adalah handler untuk: PATCH /:courseId/chapters/reorder
  */
 export const reorderChaptersController = async (
-  req: FastifyRequest<{ Params: { courseId: string }; Body: unknown }>,
-  reply: FastifyReply
-) => {
-  const parse = reorderChapterSchema.safeParse(sanitizeInput(req.body));
-  if (!parse.success)
-    return reply.status(400).send({ error: parse.error.flatten() });
-
-  const user = (req as any).user;
-  const { courseId } = req.params;
-
-  const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
-  if (!isOwner) return reply.status(403).send({ message: 'Unauthorized' });
-
-  await reorderChaptersService(courseId, parse.data.chapters);
-  reply.code(200).send({ message: 'Chapter order updated' });
-};
-
-export const getChaptersAndLessonsController = async (
-  req: FastifyRequest<{ Params: { slug: string } }>,
+  req: FastifyRequest,
   reply: FastifyReply
 ) => {
   try {
-    // 🔐 CONTROL ENROLLMENT
-    // const user = (req as any).user;
-    // const { courseId } = req.params;
+    const { courseId } = req.params as { courseId: string };
 
-    // const isPurchased = await validateUserEnrollment(user._id, courseId);
-    // if (!isPurchased) {
-    //   return reply
-    //     .status(403)
-    //     .send({ message: `You're not enrolled this course yet.` });
-    // }
+    // 1. Validasi Input (Logika Bisnis BFF)
+    //    Kita validasi bahwa body adalah array yang benar
+    const result = reorderChaptersSchema.safeParse(req.body);
+    if (!result.success) {
+      return reply
+        .status(400)
+        .send({ message: 'Invalid input: body must be an array of {id, order}', errors: result.error.flatten() });
+    }
+    const data = result.data; // [{id: "...", order: ...}, ...]
 
-    const chapters = await prisma.chapter.findMany({
-      where: { slug: req.params.slug },
-      orderBy: { order: 'asc' },
-      include: {
-        lessons: {
-          orderBy: { order: 'asc' },
-        },
-      },
-    });
+    // 2. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id || !user.role) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
 
-    reply.send(chapters);
-  } catch (err) {
-    console.error(err);
-    reply.status(500).send({ message: 'Failed to fetch course structure' });
+    // 3. Validasi Kepemilikan (Logika Bisnis "Pintar" BFF)
+    const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
+    if (!isOwner) {
+      return reply.status(403).send({ message: 'Access Denied.' });
+    }
+    
+    // 4. Panggil Go service "bodoh" (via service axios)
+    const response = await reorderChaptersService(
+      courseId,
+      data,
+      user.id // Kirim "Paspor"
+    );
+
+    return reply.status(200).send(response); // { message: "..." }
+
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in reorderChaptersController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      // Error 400 dari Go akan ditangkap di sini
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
 
-export const deleteChapterController = async (
-  req: FastifyRequest<{
-    Params: { courseId: string; chapterId: string };
-  }>,
+// ✅
+// (GET /:courseId/chapters)
+export const getChaptersAndLessonsController = async (
+  req: FastifyRequest,
   reply: FastifyReply
 ) => {
-  const user = (req as any).user;
-  const { courseId, chapterId } = req.params;
+  try {
+    const { courseId } = req.params as { courseId: string };
+    const authId = (req as any).user?.id; // Diambil dari gateway
+    const role = (req as any).user?.role; // Diambil dari gateway
 
-  const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
-  if (!isOwner) {
-    return reply.status(403).send({ message: 'Unauthorized' });
+    // 1. Panggil Go service "bodoh" (via service yang sudah ada)
+    //    Ini memanggil GET /internal/courses/:id
+    const course: CourseFromGo = await getCourseByIdService(courseId);
+
+    // 2. Logika Bisnis "Pintar" (Akses)
+    //    Logika ini identik dengan getCourseByIdController
+    const isPublished = course.status === 'PUBLISHED';
+    const isArchived = course.status === 'ARCHIVED';
+
+    let canAccess = false;
+
+    if (isPublished) {
+      // Boleh dilihat semua orang
+      canAccess = true;
+    } else if (authId && role) {
+      // Jika tidak dipublikasi, cek otorisasi
+      if (role === 'admin') {
+        canAccess = true;
+      }
+      // Cek kepemilikan Teacher
+      else if (role === 'teacher' && course.teacherId === (await prisma.teacher.findUnique({ where: { authId } }))?.id) {
+        canAccess = true;
+      }
+      // Cek kepemilikan Student (via Payment-service)
+      else {
+        const { isEnrolled } = await checkEnrollmentService(authId, course.id);
+        if (isEnrolled && !isArchived) {
+          canAccess = true;
+        }
+      }
+    }
+
+    // 3. Kembalikan data
+    if (canAccess) {
+      // Berhasil, tapi HANYA kembalikan chapters-nya
+      return reply.send(course.chapters || []);
+    }
+
+    // Jika tidak lolos semua, 404
+    return reply.status(404).send({ message: 'Course chapters not found' });
+
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in getChaptersAndLessonsController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message === 'Course not found') {
+        return reply.status(404).send({ message: 'Course not found' });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
+};
 
-  await deleteChapterService(courseId, chapterId);
+/**
+ * ✅ 
+ * (INI ADALAH FUNGSI BFF YANG "PINTAR")
+ * Menangani penghapusan chapter.
+ * Ini adalah handler untuk: DELETE /:courseId/chapters/:chapterId
+ */
+export const deleteChapterController = async (
+  req: FastifyRequest,
+  reply: FastifyReply
+) => {
+  try {
+    const { courseId, chapterId } = req.params as { courseId: string; chapterId: string };
 
-  return reply.code(204).send(); // No Content
+    // 1. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id || !user.role) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
+
+    // 2. Validasi Kepemilikan (Logika Bisnis "Pintar" BFF)
+    //    Kita tetap validasi di sini (fail-fast)
+    const isOwner = await validateCourseOwnership(user.id, courseId, user.role);
+    if (!isOwner) {
+      return reply.status(403).send({ message: 'Access Denied.' });
+    }
+    
+    // 3. Panggil Go service "bodoh" (via service axios)
+    //    Go service akan melakukan verifikasi kedua DI DALAM transaksi
+    //    dan menghapus semua lesson terkait.
+    const response = await deleteChapterService(
+      courseId,
+      chapterId,
+      user.id // Kirim "Paspor"
+    );
+
+    return reply.status(200).send(response); // { message: "..." }
+
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in deleteChapterController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+         return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+         return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
+  }
 };

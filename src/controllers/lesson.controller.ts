@@ -1,20 +1,18 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { createLesson, reorderLessons } from '../services/lesson.service';
+import {
+  createLessonService,
+  createLessonSchema,
+    updateLessonService, 
+  updateLessonSchema, 
+} from '../services/lesson.service';
 import { prisma } from '../utils/prisma';
-import { validateCourseOwnership } from '../utils/validateAccess';
+import { validateCourseOwnership, validateLessonOwnership } from '../utils/validateAccess';
 import sanitizeInput from '../utils/xInputSanitize';
 import { createChapterService } from '../services/chapter.service';
 import { generateCourseSlug, generateChapterSlug } from '../utils/slug';
 import { Lesson } from '../../generated/prisma';
-
-const createLessonSchema = z.object({
-  title: z.string().min(1),
-  playbackId: z.string().min(1),
-  duration: z.number().optional(),
-  order: z.number(), // wajib ya biar Prisma nggak error
-  isPreview: z.boolean().optional(),
-});
+import { validateChapterOwnership } from '../utils/validateAccess';
 
 const reorderLessonSchema = z.array(
   z.object({
@@ -22,6 +20,14 @@ const reorderLessonSchema = z.array(
     order: z.number(),
   })
 );
+
+// const updateLessonSchema = z.object({
+//   title: z.string().optional(),
+//   playbackId: z.string().optional(),
+//   duration: z.number().optional(),
+//   order: z.number().optional(),
+//   isPreview: z.boolean().optional(),
+// });
 
 export const addLessonToChapterController = async (
   req: FastifyRequest<{ Params: { chapterId: string }; Body: unknown }>,
@@ -33,7 +39,7 @@ export const addLessonToChapterController = async (
 
   const user = (req as any).user;
   const { chapterId } = req.params;
-  const { title, playbackId, duration, order } = parse.data;
+  const { title, order } = parse.data;
 
   const chapter = await prisma.chapter.findUnique({
     where: { id: chapterId },
@@ -48,52 +54,77 @@ export const addLessonToChapterController = async (
   );
   if (!isOwner) return reply.status(403).send({ message: 'Unauthorized' });
 
-  const lesson = await createLesson(
-    chapterId,
-    title,
-    playbackId,
-    duration,
-    order
-  );
-  reply.code(201).send(lesson);
+  // const lesson = await createLessonService(
+  //   chapterId,
+  //   title,
+  //   playbackId,
+  //   duration,
+  //   order
+  // );
+  // reply.code(201).send(lesson);
 };
 
+/**
+ * ✅ 
+ * (INI ADALAH FUNGSI BFF YANG "PINTAR")
+ * Menangani pembuatan lesson baru (kosong).
+ * Ini adalah handler untuk: POST /:chapterId/lessons
+ */
 export const createEmptyLesson = async (
-  req: FastifyRequest<{ Params: { chapterId: string }; Body: Partial<Lesson> }>,
+  req: FastifyRequest,
   reply: FastifyReply
 ) => {
-  const user = (req as any).user;
-  const { chapterId } = req.params;
-  console.log('sjhgdbxj :: ', user);
-  const chapter = await prisma.chapter.findUnique({
-    where: { id: chapterId },
-    include: { course: true },
-  });
+  try {
+    const { chapterId } = req.params as { chapterId: string };
 
-  if (!chapter) {
-    return reply.status(404).send({ message: 'Chapter not found' });
-  }
+    // 1. Validasi Input (Logika Bisnis BFF)
+    const result = createLessonSchema.safeParse(req.body);
+    if (!result.success) {
+      return reply
+        .status(400)
+        .send({ message: 'Invalid input', errors: result.error.flatten() });
+    }
+    const data = result.data;
 
-  const isOwner = await validateCourseOwnership(
-    user.id,
-    chapter.courseId,
-    user.role
-  );
-  if (!isOwner) {
-    return reply.status(403).send({ message: 'Unauthorized' });
-  }
+    // 2. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id || !user.role) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
 
-  const newLesson = await prisma.lesson.create({
-    data: {
+    // 3. Validasi Kepemilikan "Pintar" (BFF)
+    //    (Cek apakah user ini pemilik chapter)
+    const isOwner = await validateChapterOwnership(
+      user.id,
       chapterId,
-      title: '', // kosong dulu
-      playbackId: '', // kosong dulu
-      duration: 0,
-      order: req.body.order ?? 0,
-    },
-  });
+      user.role
+    );
+    if (!isOwner) {
+      return reply.status(403).send({ message: 'Access Denied.' });
+    }
 
-  return reply.code(201).send(newLesson);
+    // 4. Panggil Go service "bodoh" (via service axios)
+    const newLesson = await createLessonService(
+      chapterId,
+      data,
+      user.id // Kirim "Paspor"
+    );
+
+    return reply.status(201).send(newLesson);
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in createEmptyLesson (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+        return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+        return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
+  }
 };
 
 export const reorderLessonsController = async (
@@ -120,60 +151,70 @@ export const reorderLessonsController = async (
   );
   if (!isOwner) return reply.status(403).send({ message: 'Unauthorized' });
 
-  await reorderLessons(chapterId, parse.data);
+  // await reorderLessons(chapterId, parse.data);
   reply.code(200).send({ message: 'Lesson order updated' });
 };
 
-const updateLessonSchema = z.object({
-  title: z.string().optional(),
-  playbackId: z.string().optional(),
-  duration: z.number().optional(),
-  order: z.number().optional(),
-  isPreview: z.boolean().optional(),
-});
-
+/**
+ * ✅ --- FUNGSI INI SEKARANG DIPERBAIKI (Refactored) ---
+ * (INI ADALAH FUNGSI BFF YANG "PINTAR")
+ * Menangani update metadata lesson (oleh Teacher).
+ * Ini adalah handler untuk: PATCH /lessons/:id
+ */
 export const updateLessonController = async (
-  req: FastifyRequest<{ Params: { id: string }; Body: unknown }>,
+  req: FastifyRequest,
   reply: FastifyReply
 ) => {
-  const parse = updateLessonSchema.safeParse(req.body);
-  if (!parse.success) {
-    return reply.status(400).send({ error: parse.error.flatten() });
-  }
-
-  const user = (req as any).user;
-  const lesson = await prisma.lesson.findUnique({
-    where: { id: req.params.id },
-    include: { chapter: true },
-  });
-
-  if (!lesson) {
-    return reply.status(404).send({ message: 'Lesson not found' });
-  }
-
-  const isOwner = await validateCourseOwnership(
-    user.id,
-    lesson.chapter.courseId,
-    user.role
-  );
-
-  if (!isOwner) return reply.status(403).send({ message: 'Unauthorized' });
-
-  if (lesson.isPreview && !lesson.playbackId) {
-    return reply.status(400).send({
-      error: 'Project must be saved before enabling preview',
-    });
-  }
   try {
-    const updated = await prisma.lesson.update({
-      where: { id: req.params.id },
-      data: parse.data,
-    });
+    const { id } = req.params as { id: string }; // Ini adalah lessonId
 
-    reply.send(updated);
-  } catch (err) {
-    console.error(err);
-    reply.status(500).send({ message: 'Failed to update lesson' });
+    // 1. Validasi Input (Logika Bisnis BFF)
+    const result = updateLessonSchema.safeParse(req.body);
+    if (!result.success) {
+      return reply
+        .status(400)
+        .send({ message: 'Invalid input', errors: result.error.flatten() });
+    }
+    const data = result.data; // { title?, order?, isPreview? }
+
+    // 2. Ambil User (Logika Bisnis BFF)
+    const user = (req as any).user;
+    if (!user || !user.id || !user.role) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
+
+    // 3. Validasi Kepemilikan "Pintar" (BFF)
+    //    (Kita perlu fungsi 'validateLessonOwnership' baru)
+    const isOwner = await validateLessonOwnership(
+      user.id,
+      id, // lessonId
+      user.role
+    );
+    if (!isOwner) {
+      return reply.status(403).send({ message: 'Access Denied.' });
+    }
+
+    // 4. Panggil Go service "bodoh" (via service axios)
+    const updatedLesson = await updateLessonService(
+      id, // lessonId
+      data,
+      user.id // Kirim "Paspor"
+    );
+
+    return reply.status(200).send(updatedLesson);
+  } catch (err: unknown) {
+    // Error handling yang aman
+    console.error('Error in updateLessonController (BFF):', err);
+    if (err instanceof Error) {
+      if (err.message.includes('Forbidden')) {
+        return reply.status(403).send({ message: err.message });
+      }
+      if (err.message.includes('not found')) {
+        return reply.status(404).send({ message: err.message });
+      }
+      return reply.status(500).send({ message: err.message });
+    }
+    return reply.status(500).send({ message: 'An unknown error occurred' });
   }
 };
 
